@@ -1,0 +1,227 @@
+name: Release App
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag version to build (e.g. v0.1.6). Leave empty to build the latest git tag.'
+        required: false
+        default: ''
+
+jobs:
+  publish-tauri:
+    permissions:
+      contents: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'macos-latest'
+            target: 'aarch64-apple-darwin'
+            args: '--target aarch64-apple-darwin --bundles dmg'
+            binary_name: 'avdl'
+          - platform: 'windows-latest'
+            target: 'x86_64-pc-windows-msvc'
+            args: '--bundles nsis'
+            binary_name: 'avdl.exe'
+          - platform: 'ubuntu-22.04'
+            target: 'x86_64-unknown-linux-gnu'
+            args: '--bundles appimage'
+            binary_name: 'avdl'
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set Release Tag
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            git fetch --tags --force
+            TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.1.5)"
+          fi
+          echo "EFFECTIVE_TAG=$TAG" >> $GITHUB_ENV
+          echo "Using release tag: $TAG"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install System Dependencies (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ffmpeg
+
+      - name: Install Frontend Dependencies
+        run: bun install
+
+      - name: Sync Version from Git Tag
+        shell: bash
+        run: bun scripts/version.cjs ${{ env.EFFECTIVE_TAG }}
+
+      # 从 CHANGELOG.md 提取对应版本的发布说明，传给 tauri-action 避免默认被 commit message 覆盖
+      - name: Extract Release Notes from CHANGELOG.md
+        id: changelog
+        shell: bash
+        run: |
+          if [ -f CHANGELOG.md ]; then
+            python3 - "$GITHUB_WORKSPACE/CHANGELOG.md" "${{ env.EFFECTIVE_TAG }}" \
+              "$GITHUB_WORKSPACE/release_body.md" <<'PYEOF'
+          import re, sys
+          text = open(sys.argv[1], encoding='utf-8').read()
+          version = sys.argv[2].lstrip('v')
+          m = re.search(r'(?m)^##\s+\[%s\]' % re.escape(version), text)
+          if not m:
+              m = re.search(r'(?m)^##\s', text)
+          if not m:
+              sys.exit(0)
+          start = m.start()
+          m2 = re.search(r'(?m)^##\s', text[start + 1:])
+          end = start + 1 + m2.start() if m2 else len(text)
+          with open(sys.argv[3], 'w', encoding='utf-8') as out:
+              out.write(text[start:end].rstrip() + "\n")
+          PYEOF
+          fi
+          if [ -s "$GITHUB_WORKSPACE/release_body.md" ]; then
+            echo "body<<EOF" >> "$GITHUB_OUTPUT"
+            cat "$GITHUB_WORKSPACE/release_body.md" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "body=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and Package with Tauri Action
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ env.EFFECTIVE_TAG }}
+          releaseName: 'AVDL ${{ env.EFFECTIVE_TAG }}'
+          releaseBody: ${{ steps.changelog.outputs.body }}
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      # Portable binary artifacts for all three platforms
+      - name: Upload Portable Binary
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EFFECTIVE_TAG: ${{ env.EFFECTIVE_TAG }}
+        run: |
+          set -euo pipefail
+          TAG="${EFFECTIVE_TAG}"
+          echo "Packaging portable artifact for ${TAG} on ${{ matrix.platform }}"
+
+          # Locate compiled binary directly in release directory
+          BIN=""
+          for candidate in \
+            "src-tauri/target/${{ matrix.target }}/release/${{ matrix.binary_name }}" \
+            "src-tauri/target/release/${{ matrix.binary_name }}"; do
+            if [ -f "$candidate" ]; then
+              BIN="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$BIN" ]; then
+            echo "::error::Binary ${{ matrix.binary_name }} not found. Searching target dir:"
+            find src-tauri/target -type f -name "${{ matrix.binary_name }}" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Found binary at $BIN"
+
+          case "${{ matrix.platform }}" in
+            macos-latest)
+              ZIP_NAME="AVDL_${TAG}_mac_arm64.zip"
+              cp "$BIN" ./avdl
+              chmod +x ./avdl
+              zip -j "${ZIP_NAME}" ./avdl
+              gh release upload "${TAG}" "${ZIP_NAME}" --clobber
+              ;;
+            windows-latest)
+              EXE_NAME="AVDL_${TAG}_windows_x64.exe"
+              cp "$BIN" "./${EXE_NAME}"
+              gh release upload "${TAG}" "./${EXE_NAME}" --clobber
+              ;;
+            ubuntu-22.04)
+              TAR_NAME="AVDL_${TAG}_linux_x64.tar.gz"
+              cp "$BIN" ./avdl
+              chmod +x ./avdl
+              tar -czvf "${TAR_NAME}" avdl
+              gh release upload "${TAG}" "./${TAR_NAME}" --clobber
+              ;;
+          esac
+
+  # 在所有平台编译及上传全部完成后，独立运行一次终态校准，确保 Release 说明绝对为 CHANGELOG 内容，杜绝竞态覆盖
+  update-release-notes:
+    needs: publish-tauri
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set Release Tag
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            git fetch --tags --force
+            TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.1.5)"
+          fi
+          echo "EFFECTIVE_TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Finalize Release Notes from CHANGELOG.md
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f CHANGELOG.md ]; then
+            echo "CHANGELOG.md not found — skipping release notes"
+            exit 0
+          fi
+          python3 - "$GITHUB_WORKSPACE/CHANGELOG.md" "$EFFECTIVE_TAG" \
+            "$GITHUB_WORKSPACE/release_body.md" <<'PYEOF'
+          import re, sys
+          text = open(sys.argv[1], encoding='utf-8').read()
+          version = sys.argv[2].lstrip('v')
+          m = re.search(r'(?m)^##\s+\[%s\]' % re.escape(version), text)
+          if not m:
+              m = re.search(r'(?m)^##\s', text)
+          if not m:
+              sys.exit(0)
+          start = m.start()
+          m2 = re.search(r'(?m)^##\s', text[start + 1:])
+          end = start + 1 + m2.start() if m2 else len(text)
+          with open(sys.argv[3], 'w', encoding='utf-8') as out:
+              out.write(text[start:end].rstrip() + "\n")
+          PYEOF
+
+          if [ -s "$GITHUB_WORKSPACE/release_body.md" ]; then
+            gh release edit "$EFFECTIVE_TAG" --notes-file "$GITHUB_WORKSPACE/release_body.md"
+            echo "Release notes finalized for $EFFECTIVE_TAG from CHANGELOG.md"
+          fi
